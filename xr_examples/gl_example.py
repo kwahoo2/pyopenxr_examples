@@ -4,10 +4,20 @@ import logging
 import glfw
 import platform
 from OpenGL import GL
+windowing_interface = None
 if platform.system() == "Windows":
     from OpenGL import WGL
+    windowing_interface = "WGL"
 elif platform.system() == "Linux":
-    from OpenGL import GLX
+    try:
+        from OpenGL import GLX
+        windowing_interface = "GLX"
+    except Exception:
+        try:
+            from OpenGL import EGL
+            windowing_interface = "EGL"
+        except ImportError:
+            print("No Windowing Interface found!")
 
 import xr
 
@@ -122,10 +132,12 @@ class OpenXrExample(object):
         self.pxrDestroyDebugUtilsMessengerEXT = None
         self.pxrGetOpenGLGraphicsRequirementsKHR = None
         self.graphics_requirements = xr.GraphicsRequirementsOpenGLKHR()
-        if platform.system() == 'Windows':
+        if windowing_interface == 'WGL':
             self.graphics_binding = xr.GraphicsBindingOpenGLWin32KHR()
-        elif platform.system() == 'Linux':
+        elif windowing_interface == 'GLX':
             self.graphics_binding = xr.GraphicsBindingOpenGLXlibKHR()
+        elif windowing_interface == 'EGL':
+            self.graphics_binding = xr.GraphicsBindingEGLMNDX()
         else:
             raise NotImplementedError('Unsupported platform')
         self.render_target_size = None
@@ -181,6 +193,8 @@ class OpenXrExample(object):
         if xr.EXT_DEBUG_UTILS_EXTENSION_NAME not in discovered_extensions:
             self.enable_debug = False
         requested_extensions = [xr.KHR_OPENGL_ENABLE_EXTENSION_NAME]
+        if windowing_interface == 'EGL':
+            requested_extensions.append(xr.MNDX_EGL_ENABLE_EXTENSION_NAME)
         if self.enable_debug:
             requested_extensions.append(xr.EXT_DEBUG_UTILS_EXTENSION_NAME)
         for extension in requested_extensions:
@@ -241,6 +255,8 @@ class OpenXrExample(object):
         glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 4)
         glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 5)
         glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+        if windowing_interface == 'EGL':
+            glfw.window_hint(glfw.CONTEXT_CREATION_API, glfw.EGL_CONTEXT_API)
         self.window_size = [s // 4 for s in self.render_target_size]
         self.window = glfw.create_window(*self.window_size, "gl_example", None, None)
         if self.window is None:
@@ -251,13 +267,35 @@ class OpenXrExample(object):
         glfw.swap_interval(0)
 
     def prepare_xr_session(self):
-        if platform.system() == 'Windows':
+        if windowing_interface == 'WGL':
             self.graphics_binding.h_dc = WGL.wglGetCurrentDC()
             self.graphics_binding.h_glrc = WGL.wglGetCurrentContext()
-        else:
+        elif windowing_interface == 'GLX':
             self.graphics_binding.x_display = GLX.glXGetCurrentDisplay()
             self.graphics_binding.glx_context = GLX.glXGetCurrentContext()
             self.graphics_binding.glx_drawable = GLX.glXGetCurrentDrawable()
+        elif windowing_interface == 'EGL':
+            display = glfw.get_egl_display()
+            context = glfw.get_egl_context(self.window)
+            self.graphics_binding.context = ctypes.cast(context, ctypes.c_void_p)
+            self.graphics_binding.display = ctypes.cast(display, ctypes.c_void_p)
+            self.graphics_binding.get_proc_address = ctypes.cast(EGL.eglGetProcAddress.load(), xr.PFN_xrEglGetProcAddressMNDX)
+            config_id = EGL.EGLint()
+            EGL.eglQueryContext(display, context, EGL.EGL_CONFIG_ID, ctypes.byref(config_id))
+            num_configs = EGL.EGLint()
+            EGL.eglGetConfigs(display, None, 0, ctypes.byref(num_configs))
+            configs = (ctypes.c_void_p * num_configs.value)()
+            EGL.eglGetConfigs(display, configs, num_configs.value, ctypes.byref(num_configs))
+            config = None
+            for i in range(num_configs.value):
+                current_config_id = EGL.EGLint()
+                EGL.eglGetConfigAttrib(display, configs[i], EGL.EGL_CONFIG_ID, ctypes.byref(current_config_id))
+                if current_config_id.value == config_id.value:
+                    config = configs[i]
+                    break
+            if not config:
+                raise Exception("No matching EGL config found")
+            self.graphics_binding.config = config
         pp = ctypes.cast(ctypes.pointer(self.graphics_binding), ctypes.c_void_p)
         sci = xr.SessionCreateInfo(0, self.system_id, next=pp)
         self.session = xr.create_session(self.instance, sci)
